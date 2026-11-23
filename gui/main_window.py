@@ -16,12 +16,15 @@ from PySide6.QtWidgets import (
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
+from PySide6.QtWidgets import QFileDialog, QMessageBox
 
 from serial.tools import list_ports
 
 from core.serial_worker import SerialWorker
-from parsers.log_parser import LogParser
+from core.log_storage import LogStorage
+from parsers.log_parser import LogParser, ParsedMessage
 
+from pathlib import Path
 
 class MainWindow(QMainWindow):
 
@@ -38,11 +41,14 @@ class MainWindow(QMainWindow):
 
         super().__init__()
 
-        self.setWindowTitle("ESP32 Serial Analyzer v0.2")
+        self.setWindowTitle("ESP32 Serial Analyzer v0.3")
         self.resize(1200, 750)
 
         self.worker = None
         self.log_parser = LogParser()
+        self.log_storage = LogStorage()
+        self.viewing_log = False
+        self.loading_log = False
 
         self.rx_bytes = 0
         self.tx_bytes = 0
@@ -214,12 +220,34 @@ class MainWindow(QMainWindow):
 
         self.clear_button = QPushButton("Clear log")
 
+        self.start_logging_button = QPushButton("Start Logging")
+        self.stop_logging_button = QPushButton("Stop Logging")
+        self.save_log_button = QPushButton("Save Log As...")
+        self.open_log_button = QPushButton("Open Log")
+        self.return_live_button = QPushButton("Return to Live")
+
+        self.stop_logging_button.setEnabled(False)
+        self.return_live_button.setEnabled(False)
+
+        self.logging_status_label = QLabel("Logging: OFF")
+
         self.counter_label = QLabel(
             "RX: 0 bytes | TX: 0 bytes"
         )
 
         bottom_layout.addWidget(self.clear_button)
+        bottom_layout.addSpacing(15)
+
+        bottom_layout.addWidget(self.start_logging_button)
+        bottom_layout.addWidget(self.stop_logging_button)
+        bottom_layout.addWidget(self.save_log_button)
+
+        bottom_layout.addWidget(self.logging_status_label)
+        bottom_layout.addWidget(self.open_log_button)
+        bottom_layout.addWidget(self.return_live_button)
+
         bottom_layout.addStretch()
+
         bottom_layout.addWidget(self.counter_label)
 
         main_layout.addLayout(bottom_layout)
@@ -248,6 +276,26 @@ class MainWindow(QMainWindow):
 
         self.clear_button.clicked.connect(
             self.clear_log
+        )
+
+        self.start_logging_button.clicked.connect(
+            self.start_logging
+        )
+
+        self.stop_logging_button.clicked.connect(
+            self.stop_logging
+        )
+
+        self.save_log_button.clicked.connect(
+            self.save_log_as
+        )
+
+        self.open_log_button.clicked.connect(
+            self.open_log
+        )
+
+        self.return_live_button.clicked.connect(
+            self.return_to_live
         )
 
     # -------------------------------------------------
@@ -334,15 +382,21 @@ class MainWindow(QMainWindow):
 
         messages = self.log_parser.feed(data)
 
+        if self.viewing_log:
+            return
+
         for message in messages:
 
             self.add_log_message(message)
+
+            if self.log_storage.is_logging:
+                self.log_storage.write_message(message)
 
     def add_log_message(self, message):
 
         table = self.log_table
 
-        if table.rowCount() >= self.MAX_ROWS:
+        if not self.loading_log and table.rowCount() >= self.MAX_ROWS:
             table.removeRow(0)
 
         row = table.rowCount()
@@ -455,3 +509,220 @@ class MainWindow(QMainWindow):
         self.tx_bytes = 0
 
         self.update_counters()
+
+    # -------------------------------------------------
+    # LOG STORAGE
+    # -------------------------------------------------
+
+    def start_logging(self):
+
+        try:
+
+            file_path = self.log_storage.start_logging()
+
+            self.start_logging_button.setEnabled(False)
+            self.stop_logging_button.setEnabled(True)
+
+            self.logging_status_label.setText("Logging: ON")
+
+            self.status_label.setText(
+                f"Saving logs: {file_path.name}"
+            )
+
+        except Exception as error:
+
+            QMessageBox.critical(
+                self,
+                "Logging error",
+                str(error)
+            )
+
+    def stop_logging(self):
+
+        self.log_storage.stop_logging()
+
+        self.start_logging_button.setEnabled(True)
+        self.stop_logging_button.setEnabled(False)
+
+        self.logging_status_label.setText("Logging: OFF")
+
+        self.status_label.setText("Logging stopped")
+
+
+    def save_log_as(self):
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Log As",
+            "",
+            "JSON Lines (*.jsonl)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+
+            records = []
+
+            for row in range(self.log_table.rowCount()):
+
+                timestamp = self.log_table.item(row, 0).text()
+                level = self.log_table.item(row, 1).text().lower()
+                module = self.log_table.item(row, 2).text()
+                message = self.log_table.item(row, 3).text()
+
+                records.append({
+                    "timestamp": timestamp or None,
+                    "level": level if level != "other" else None,
+                    "module": module or None,
+                    "message": message,
+                    "text": message
+                })
+
+            self.log_storage.save_records(
+                records,
+                file_path
+            )
+
+            QMessageBox.information(
+                self,
+                "Save Log",
+                f"Log saved successfully:\n{file_path}"
+            )
+
+        except Exception as error:
+
+            QMessageBox.critical(
+                self,
+                "Save error",
+                str(error)
+            )
+
+    # -------------------------------------------------
+    # LOG VIEWER
+    # -------------------------------------------------
+
+    def open_log(self):
+
+        # Не допускаем смешивания текущей записи и открываемого файла.
+        if self.log_storage.is_logging:
+
+            QMessageBox.warning(
+                self,
+                "Logging is active",
+                "Stop logging before opening another log file."
+            )
+
+            return
+
+        # Если UART подключён, предупреждаем о переходе в режим просмотра.
+        if self.worker and self.worker.isRunning():
+
+            answer = QMessageBox.question(
+                self,
+                "UART is connected",
+                "UART connection is active.\n\n"
+                "Live messages will be temporarily hidden while "
+                "viewing the saved log.\n\n"
+                "Continue?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Log",
+            str(self.log_storage.logs_dir),
+            "JSON Lines (*.jsonl);;All files (*)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+
+            records = self.log_storage.load_log(file_path)
+
+        except (OSError, UnicodeError) as error:
+
+            QMessageBox.critical(
+                self,
+                "Open Log Error",
+                str(error)
+            )
+
+            return
+
+        # Загружаем файл только после успешного чтения.
+        self.log_table.setRowCount(0)
+
+        self.viewing_log = True
+        self.loading_log = True
+
+        try:
+
+            for record in records:
+
+                timestamp = record.get("timestamp")
+                level = record.get("level")
+                module = record.get("module")
+                message = record.get("message")
+                text = record.get("text")
+
+                if not text:
+
+                    text = (
+                        f"[{timestamp or ''}] "
+                        f"<{level or 'other'}> "
+                        f"{module or ''}: "
+                        f"{message or ''}"
+                    )
+
+                parsed_message = ParsedMessage(
+                    text=text,
+                    timestamp=timestamp,
+                    level=level,
+                    module=module,
+                    message=message
+                )
+
+                self.add_log_message(parsed_message)
+
+        finally:
+
+            self.loading_log = False
+
+        self.open_log_button.setEnabled(False)
+        self.return_live_button.setEnabled(True)
+
+        self.status_label.setText(
+            f"Viewing log: {Path(file_path).name}"
+        )
+
+        self.log_table.scrollToBottom()
+
+    def return_to_live(self):
+
+        self.log_table.setRowCount(0)
+
+        self.viewing_log = False
+
+        self.open_log_button.setEnabled(True)
+        self.return_live_button.setEnabled(False)
+
+        if self.worker and self.worker.isRunning():
+
+            self.status_label.setText(
+                "Connected - Live monitoring"
+            )
+
+        else:
+
+            self.status_label.setText(
+                "Disconnected"
+            )
