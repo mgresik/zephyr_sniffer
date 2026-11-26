@@ -199,6 +199,13 @@ class MainWindow(QMainWindow):
             "Enter command..."
         )
 
+        self.command_format = QComboBox()
+
+        self.command_format.addItems([
+            "ASCII",
+            "HEX"
+        ])
+
         self.send_button = QPushButton("SEND")
 
         self.newline_checkbox = QCheckBox(
@@ -209,6 +216,7 @@ class MainWindow(QMainWindow):
 
         command_layout.addWidget(QLabel(">"))
         command_layout.addWidget(self.command_input)
+        command_layout.addWidget(self.command_format)
         command_layout.addWidget(self.send_button)
         command_layout.addWidget(self.newline_checkbox)
 
@@ -472,22 +480,75 @@ class MainWindow(QMainWindow):
         if not self.worker or not self.worker.isRunning():
             return
 
-        command = self.command_input.text()
+        command = self.command_input.text().strip()
 
         if not command:
             return
 
-        data = command.encode("utf-8")
+        # ASCII MODE
+
+        if self.command_format.currentText() == "ASCII":
+
+            data = command.encode("utf-8")
+
+        # HEX MODE
+
+        else:
+
+            try:
+
+                # Поддержка форматов:
+                # FF 01 A5
+                # FF01A5
+                # 0xFF 0x01 0xA5
+
+                hex_string = command.replace("0x", "")
+                hex_string = hex_string.replace("0X", "")
+                hex_string = hex_string.replace(" ", "")
+                hex_string = hex_string.replace("\t", "")
+
+                if len(hex_string) % 2 != 0:
+                    raise ValueError(
+                        "HEX string must contain pairs of digits."
+                    )
+
+                data = bytes.fromhex(hex_string)
+
+            except ValueError as error:
+
+                QMessageBox.warning(
+                    self,
+                    "Invalid HEX data",
+                    str(error)
+                )
+
+                return
+
+        # APPEND NEWLINE
 
         if self.newline_checkbox.isChecked():
             data += b"\n"
-
+    
+        # SEND DATA
+    
         written = self.worker.send_data(data)
-
+    
         self.tx_bytes += written
-
+    
         self.update_counters()
-
+    
+        if written != len(data):
+        
+            QMessageBox.warning(
+                self,
+                "Transmission warning",
+                f"Not all bytes were transmitted.\n"
+                f"Expected: {len(data)}\n"
+                f"Written: {written}"
+            )
+    
+            return
+    
         self.command_input.clear()
 
     # -------------------------------------------------
